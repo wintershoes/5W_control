@@ -16,33 +16,32 @@ source ~/kuavo_ros_application/devel/setup.bash
 
 - `chassis_adapter.py`：唯一的底盘接口文件，包含 ROS 位姿读取、HTTP 模式/运动/导航命令、站点导航等待、AMCL 闭环相对移动和旋转。
 - `run_pick_place_chassis.py`：底盘抓放运行主程序。支持普通工件、U 盘或依次运行两套流程；抓取和放置动作当前留空。
-- `keyboard_chassis_control.py`：上位机终端离散式键盘遥控。每条单字符命令只执行一次短脉冲，随后自动清零速度。
+- `keyboard_chassis_control.py`：浏览器键盘遥控。按下立即移动、松开立即停止，并由服务端看门狗处理失焦或网络中断。
 - `test/`：模式切换、前后移动、旋转和站点导航测试程序。
 
 ## 安全键盘遥控
 
-先查看 dry-run 参数，不连接底盘：
+SSH 终端无法可靠获得按键松开事件，因此键盘遥控使用浏览器捕获 `keydown/keyup`。先查看 dry-run 参数，不连接底盘：
 
 ```bash
 python3 keyboard_chassis_control.py
 ```
 
-确认现场安全后启动实际控制：
+确认现场安全后，在上位机启动控制服务：
 
 ```bash
 python3 keyboard_chassis_control.py --execute
 ```
 
-为避免 SSH 终端无法识别按键松开带来的风险，程序采用“单字符 + Enter”控制：
+程序会打印一个包含随机访问令牌的地址。在 Windows 浏览器打开该地址后：
 
-- `w` + Enter：短距离前进。
-- `s` + Enter：短距离后退。
-- `a` + Enter：短时间左转。
-- `d` + Enter：短时间右转。
-- `x` + Enter 或直接 Enter：重复发送零速度。
-- `q` + Enter：发送零速度并退出。
+- 按住 `W/S` 或上下方向键：前进/后退；松开立即停止。
+- 按住 `A/D` 或左右方向键：左转/右转；松开立即停止。
+- `Space` 或网页红色 `STOP`：立即停止。
+- 浏览器窗口失焦、页面隐藏或关闭：立即请求停止。
+- 控制心跳中断超过默认 `0.30s`：服务端看门狗自动清零速度。
 
-每次运动默认只有 `0.15s`，随后自动重复发送零速度。类似 `wwww` 的多字符输入不会执行运动。程序启动时会自动切换并确认 MANUAL 模式，退出后保持 MANUAL。
+服务启动时会自动切换并确认 MANUAL 模式，退出时重复发送零速度，退出后保持 MANUAL。
 
 ## 主程序用法
 
