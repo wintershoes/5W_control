@@ -66,6 +66,27 @@ class ChassisHttpClient:
         return self.send_command(payload)
 
     @staticmethod
+    def make_change_mode_payload(
+            mode: str, request_id: str = "1") -> Dict[str, Any]:
+        """构造与底盘网页相同的手动/自动模式切换命令。"""
+        normalized_mode = mode.strip().upper()
+        if normalized_mode not in ("MANUAL", "AUTO"):
+            raise ValueError("mode must be MANUAL or AUTO")
+        return {
+            "method": "ChangeMode",
+            "id": str(request_id),
+            "params": {
+                "mode": normalized_mode,
+            },
+        }
+
+    def change_mode(
+            self, mode: str, request_id: str = "1") -> Dict[str, Any]:
+        """切换底盘运行模式；MANUAL 用于 RobotMotion，AUTO 用于导航。"""
+        payload = self.make_change_mode_payload(mode, request_id)
+        return self.send_command(payload)
+
+    @staticmethod
     def make_dispatch_goal_node_name_payload(
             node_name: str, request_id: str = "1") -> Dict[str, Any]:
         """构造与网页右键站点导航相同的命令，不发送请求。"""

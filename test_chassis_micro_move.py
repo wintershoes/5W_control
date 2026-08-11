@@ -21,7 +21,8 @@
 python3 test_chassis_micro_move.py --direction forward --distance 0.02 --speed 0.03
 python3 test_chassis_micro_move.py --execute --direction back --distance 0.02 --speed 0.03
 
-注意：执行前人工确认自动模式、驱动使能、急停状态、底盘故障和周围空间。
+注意：RobotMotion 只能在手动模式执行。运行前先用 test_chassis_mode.py 切换到
+MANUAL，并人工确认驱动使能、急停状态、底盘故障和周围空间。
 """
 
 import argparse
@@ -84,13 +85,17 @@ def main():
         print("\nRefusing to use speed > 0.05m/s in this smoke test.")
         return
 
-    print("\nWarning: jaten_msgs safety checks are disabled. Confirm emergency stop, driver enable, and chassis faults manually.")
+    print("\nWarning: RobotMotion requires MANUAL mode. Confirm emergency stop, driver enable, and chassis faults manually.")
     print("Sending HTTP RobotMotion velocity pulse...")
     try:
         end_time = time.monotonic() + duration
         while time.monotonic() < end_time and not rospy.is_shutdown():
             result = http_client.robot_motion(vx, 0.0, 0.0)
             print("motion result:", result)
+            if isinstance(result, dict) and (
+                    result.get("error") or result.get("success") is False):
+                print("RobotMotion rejected; stopping immediately.")
+                break
             rospy.sleep(0.1)
     finally:
         print("Sending HTTP zero velocity stop...")

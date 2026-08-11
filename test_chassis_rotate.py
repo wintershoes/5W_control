@@ -20,7 +20,8 @@
 python3 test_chassis_rotate.py --direction left --angle 0.05 --speed 0.03
 python3 test_chassis_rotate.py --execute --direction right --angle 0.05 --speed 0.03
 
-注意：执行前人工确认自动模式、驱动使能、急停状态、底盘故障和旋转空间。
+注意：RobotMotion 只能在手动模式执行。运行前先用 test_chassis_mode.py 切换到
+MANUAL，并人工确认驱动使能、急停状态、底盘故障和旋转空间。
 """
 
 import argparse
@@ -79,13 +80,14 @@ def main():
         print("DRY RUN ONLY. Add --execute to actually rotate.")
         return
 
-    print("Warning: 请确认急停、驱动使能、自动模式和周围安全区域。")
+    print("Warning: RobotMotion 需要手动模式；请确认急停、驱动使能和周围安全区域。")
     started = time.monotonic()
     try:
         while time.monotonic() - started < duration:
             result = client.robot_motion(vx=0.0, vy=0.0, vw=vw)
             print("motion result:", result)
-            if isinstance(result, dict) and result.get("success") is False:
+            if isinstance(result, dict) and (
+                    result.get("error") or result.get("success") is False):
                 print("RobotMotion rejected; stopping immediately.")
                 break
             time.sleep(0.1)
