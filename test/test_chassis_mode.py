@@ -32,7 +32,7 @@ python3 test_chassis_mode.py --mode auto --execute
 import argparse
 import json
 
-from chassis_http_adapter import ChassisHttpClient
+from chassis_adapter import ChassisHttpClient
 
 
 def parse_mode(value):

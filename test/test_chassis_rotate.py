@@ -33,8 +33,7 @@ import time
 import rospy
 from std_msgs.msg import String
 
-from chassis_http_adapter import ChassisHttpClient
-from chassis_read_adapter import ChassisReadAdapter
+from chassis_adapter import ChassisHttpClient, ChassisReadAdapter
 
 
 def read_nav_source():
