@@ -16,9 +16,9 @@ source ~/kuavo_ros_application/devel/setup.bash
 
 - `chassis_read_adapter.py`：只读读取底盘位姿、状态、错误和导航来源。
 - `test_chassis_read_adapter.py`：只读状态检查。
-- `test_chassis_micro_move.py`：小距离移动测试，默认是 dry-run，不会发送运动指令。
+- `chassis_http_adapter.py`：调用底盘 `POST /RobotMotion` HTTP 接口。
+- `test_chassis_micro_move.py`：HTTP 小距离速度测试，默认是 dry-run，不会发送运动指令。
 
 ## 安全说明
 
-运行移动测试前必须确认机器人周围安全、急停可用，并先执行 dry-run。只有明确使用 `--execute` 时才会发送移动请求。
-
+运行移动测试前必须确认机器人周围安全、急停可用，并先执行 dry-run。只有明确使用 `--execute` 时才会发送 HTTP 移动请求。
