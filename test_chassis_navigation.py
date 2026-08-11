@@ -1,6 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""通过 jaten-api 按路网站点名称测试导航，默认只做 dry-run。"""
+"""通过当前路网中的站点名称测试底盘导航。
+
+调用方法：
+1. 使用 ChassisReadAdapter 读取 /move_base/amcl_pose 和当前导航源。
+2. 使用 ChassisHttpClient.dispatch_goal_node_name()，通过底盘 jaten-api 的
+   POST /command?cmd=<DispatchGoalNodeName JSON> 下发站点名称。
+3. 请求格式与底盘网页右键站点导航一致：
+   {"method":"DispatchGoalNodeName","id":"1","params":{"name":["NP1"]}}
+
+参数：
+--node 站点名             必填，例如 NP1；必须存在于当前加载的路网且区分大小写。
+--request-id 请求编号     默认 1，只用于请求关联，不是站点 ID。
+--host                    底盘 API 地址，默认 192.168.26.22。
+--port                    底盘 API 端口，默认 8888。
+--token                   可选的 HTTP Authorization 值。
+--execute                 实际下发导航；不提供时仅构造并打印请求。
+
+示例：
+python3 test_chassis_navigation.py --node NP1
+python3 test_chassis_navigation.py --node NP1 --execute
+
+注意：HTTP 返回只表示命令已被处理，不代表机器人已经到站。执行前确认底盘处于
+自动模式、驱动已使能、急停已释放、当前路网正确且路径无障碍。
+"""
 
 import argparse
 import json

@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
-"""底盘原地旋转的低风险测试。默认只演练，不发送运动指令。"""
+# -*- coding: utf-8 -*-
+"""底盘原地左转/右转测试。
+
+调用方法：
+1. 使用 ChassisReadAdapter.get_current_pose() 读取旋转前后的当前位置和朝向。
+2. 使用 ChassisHttpClient.robot_motion()，通过底盘 jaten-api 的
+   POST /command?cmd=<RobotMotion JSON> 持续发送本体系角速度 vw。
+3. 发送时长按 angle / speed 计算；结束或发生异常时发送零速度停止。
+
+参数：
+--direction left|right    左转或右转，默认 left；左转角速度为正，右转为负。
+--angle 弧度              预计旋转角度，默认 0.05，允许范围 (0, 0.2]。
+--speed 弧度/秒           角速度绝对值，默认 0.03，允许范围 (0, 0.1]。
+--host                    底盘 API 地址，默认 192.168.26.22。
+--port                    底盘 API 端口，默认 8888。
+--execute                 实际发送旋转指令；不提供时仅打印参数和状态。
+
+示例：
+python3 test_chassis_rotate.py --direction left --angle 0.05 --speed 0.03
+python3 test_chassis_rotate.py --execute --direction right --angle 0.05 --speed 0.03
+
+注意：执行前人工确认自动模式、驱动使能、急停状态、底盘故障和旋转空间。
+"""
 
 import argparse
 import time

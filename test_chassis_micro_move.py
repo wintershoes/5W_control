@@ -1,6 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""通过底盘 jaten-api 的 HTTP RobotMotion 做小距离速度测试。"""
+"""底盘小距离前进/后退测试。
+
+调用方法：
+1. 使用 ChassisReadAdapter 读取 /move_base/amcl_pose 和当前导航源，只做状态确认。
+2. 使用 ChassisHttpClient.robot_motion()，通过底盘 jaten-api 的
+   POST /command?cmd=<RobotMotion JSON> 持续发送本体系线速度。
+3. 发送时长按 distance / speed 计算；结束或发生异常时发送零速度停止。
+
+参数：
+--direction forward|back  前进或后退，默认 forward。
+--distance 米             预计移动距离，默认 0.02，测试脚本限制不超过 0.05。
+--speed 米/秒             线速度绝对值，默认 0.03，测试脚本限制不超过 0.05。
+--host                    底盘 API 地址，默认 192.168.26.22。
+--port                    底盘 API 端口，默认 8888。
+--token                   可选的 HTTP Authorization 值。
+--execute                 实际发送运动指令；不提供时仅打印参数和状态。
+
+示例：
+python3 test_chassis_micro_move.py --direction forward --distance 0.02 --speed 0.03
+python3 test_chassis_micro_move.py --execute --direction back --distance 0.02 --speed 0.03
+
+注意：执行前人工确认自动模式、驱动使能、急停状态、底盘故障和周围空间。
+"""
 
 import argparse
 import time
