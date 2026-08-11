@@ -4,9 +4,11 @@
 
 调用方法：
 1. 使用 ChassisReadAdapter 读取 /move_base/amcl_pose 和当前导航源，只做状态确认。
-2. 使用 ChassisHttpClient.robot_motion()，通过底盘 jaten-api 的
+2. 实际执行前先用零速度 RobotMotion 检查模式；如果收到自动模式错误 8211，
+   自动调用 ChangeMode(MANUAL)，并再次用零速度确认切换成功。
+3. 使用 ChassisHttpClient.robot_motion()，通过底盘 jaten-api 的
    POST /command?cmd=<RobotMotion JSON> 持续发送本体系线速度。
-3. 发送时长按 distance / speed 计算；结束或发生异常时发送零速度停止。
+4. 发送时长按 distance / speed 计算；结束或发生异常时发送零速度停止。
 
 参数：
 --direction forward|back  前进或后退，默认 forward。
@@ -22,7 +24,8 @@ python3 test_chassis_micro_move.py --direction forward --distance 0.02 --speed 0
 python3 test_chassis_micro_move.py --execute --direction back --distance 0.02 --speed 0.03
 
 注意：RobotMotion 只能在手动模式执行。运行前先用 test_chassis_mode.py 切换到
-MANUAL，并人工确认驱动使能、急停状态、底盘故障和周围空间。
+MANUAL，也可以由本脚本在执行前自动检查并切换。脚本执行后会保持手动模式，
+不会自动切回 AUTO。请人工确认驱动使能、急停状态、底盘故障和周围空间。
 """
 
 import argparse
@@ -86,6 +89,18 @@ def main():
         return
 
     print("\nWarning: RobotMotion requires MANUAL mode. Confirm emergency stop, driver enable, and chassis faults manually.")
+    print("Checking MANUAL mode with a zero-velocity RobotMotion probe...")
+    try:
+        mode_result = http_client.ensure_manual_mode()
+    except RuntimeError as exc:
+        print("Refusing to move because MANUAL mode preparation failed:", exc)
+        return
+    print("manual_mode_preparation:", mode_result)
+    if mode_result.get("changed"):
+        print("Chassis mode changed to MANUAL and verified.")
+    else:
+        print("Chassis already accepts RobotMotion; no mode change was needed.")
+
     print("Sending HTTP RobotMotion velocity pulse...")
     try:
         end_time = time.monotonic() + duration

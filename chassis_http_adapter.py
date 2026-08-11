@@ -3,6 +3,7 @@
 """HTTP client for the chassis jaten-api command endpoint."""
 
 import json
+import time
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -85,6 +86,56 @@ class ChassisHttpClient:
         """切换底盘运行模式；MANUAL 用于 RobotMotion，AUTO 用于导航。"""
         payload = self.make_change_mode_payload(mode, request_id)
         return self.send_command(payload)
+
+    @staticmethod
+    def _command_rejected(result: Dict[str, Any]) -> bool:
+        return bool(result.get("error") or result.get("success") is False)
+
+    @staticmethod
+    def _requires_manual_mode(result: Dict[str, Any]) -> bool:
+        error = result.get("error")
+        if not isinstance(error, dict) or error.get("code") != 8211:
+            return False
+        message = str(error.get("message", "")).lower()
+        return "auto mode" in message or "manual mode" in message
+
+    def ensure_manual_mode(
+            self, request_id: str = "1", verify_retries: int = 5,
+            verify_interval: float = 0.2) -> Dict[str, Any]:
+        """用零速度探测 RobotMotion；必要时切到 MANUAL 并再次确认。"""
+        probe_result = self.robot_motion(0.0, 0.0, 0.0)
+        if not self._command_rejected(probe_result):
+            return {
+                "changed": False,
+                "probe_result": probe_result,
+            }
+
+        if not self._requires_manual_mode(probe_result):
+            raise RuntimeError("RobotMotion readiness probe was rejected: {}".format(
+                probe_result
+            ))
+
+        change_result = self.change_mode("MANUAL", request_id)
+        if self._command_rejected(change_result):
+            raise RuntimeError("ChangeMode MANUAL was rejected: {}".format(
+                change_result
+            ))
+
+        last_verify_result = None
+        for _ in range(max(1, verify_retries)):
+            time.sleep(max(0.0, verify_interval))
+            last_verify_result = self.robot_motion(0.0, 0.0, 0.0)
+            if not self._command_rejected(last_verify_result):
+                return {
+                    "changed": True,
+                    "probe_result": probe_result,
+                    "change_result": change_result,
+                    "verify_result": last_verify_result,
+                }
+
+        raise RuntimeError("MANUAL mode could not be verified: {}".format(
+            last_verify_result
+        ))
 
     @staticmethod
     def make_dispatch_goal_node_name_payload(
