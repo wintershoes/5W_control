@@ -11,7 +11,7 @@ SSH 终端只能收到字符，无法可靠收到按键松开事件。本程序�
 2. 浏览器按住按键时每 80ms 发送心跳；服务端超过 watchdog 时间未收到心跳，
    自动重复发送零速度。默认 watchdog 为 0.30s。
 3. 每条控制请求带递增序号，服务端忽略乱序到达的旧请求。
-4. 服务端限制线速度、角速度，浏览器只能发送 -1/0/1 方向，不能修改速度。
+4. 服务端限制线速度、角速度；浏览器只可在硬上限内调整速度比例。
 5. 服务启动时确认 MANUAL 模式，异常退出和正常退出时都重复发送零速度。
 6. 网页使用随机访问令牌，未携带令牌的局域网请求不能控制底盘。
 
@@ -36,6 +36,7 @@ SSH 终端只能收到字符，无法可靠收到按键松开事件。本程序�
 import argparse
 import ipaddress
 import json
+import math
 import secrets
 import signal
 import socket
@@ -147,6 +148,18 @@ CONTROL_PAGE = r"""<!doctype html>
     }
     .label { color: #66717d; font-size: 12px; }
     .value { margin-top: 4px; font-family: Consolas, monospace; font-size: 15px; }
+    .speed-control {
+      display: grid;
+      grid-template-columns: 92px 1fr 58px;
+      align-items: center;
+      gap: 12px;
+      padding: 12px;
+      border: 1px solid #c9d1d9;
+      background: #ffffff;
+    }
+    .speed-control label { color: #4b5661; font-size: 13px; font-weight: 700; }
+    .speed-control input { width: 100%; accent-color: #1f6f50; }
+    #speed-value { text-align: right; font-family: Consolas, monospace; }
     #message { min-height: 20px; color: #56616d; font-size: 13px; }
     @media (max-width: 420px) {
       body { padding: 16px; }
@@ -173,15 +186,23 @@ CONTROL_PAGE = r"""<!doctype html>
 
     <button id="stop" type="button">STOP</button>
 
+    <div class="speed-control">
+      <label for="speed">SPEED</label>
+      <input id="speed" type="range" min="10" max="100" step="5" value="30">
+      <output id="speed-value" for="speed">30%</output>
+    </div>
+
     <div class="telemetry">
-      <div><div class="label">LINEAR</div><div class="value" id="linear">0</div></div>
-      <div><div class="label">ANGULAR</div><div class="value" id="angular">0</div></div>
+      <div><div class="label">LINEAR (m/s)</div><div class="value" id="linear">0.000</div></div>
+      <div><div class="label">ANGULAR (rad/s)</div><div class="value" id="angular">0.000</div></div>
     </div>
     <div id="message"></div>
   </main>
 
   <script>
     const ACCESS_TOKEN = __ACCESS_TOKEN__;
+    const MAX_LINEAR_SPEED = __MAX_LINEAR_SPEED__;
+    const MAX_ANGULAR_SPEED = __MAX_ANGULAR_SPEED__;
     const active = new Set();
     const keyAlias = {
       ArrowUp: "KeyW", ArrowDown: "KeyS",
@@ -195,6 +216,12 @@ CONTROL_PAGE = r"""<!doctype html>
     const messageEl = document.getElementById("message");
     const linearEl = document.getElementById("linear");
     const angularEl = document.getElementById("angular");
+    const speedEl = document.getElementById("speed");
+    const speedValueEl = document.getElementById("speed-value");
+
+    function speedScale() {
+      return Number(speedEl.value) / 100;
+    }
 
     function setState(text, style) {
       stateEl.textContent = text;
@@ -212,8 +239,10 @@ CONTROL_PAGE = r"""<!doctype html>
         button.classList.toggle("active", active.has(button.dataset.code));
       });
       const motion = direction();
-      linearEl.textContent = String(motion.linear);
-      angularEl.textContent = String(motion.angular);
+      const scale = speedScale();
+      linearEl.textContent = (motion.linear * MAX_LINEAR_SPEED * scale).toFixed(3);
+      angularEl.textContent = (motion.angular * MAX_ANGULAR_SPEED * scale).toFixed(3);
+      speedValueEl.textContent = `${speedEl.value}%`;
       setState(motion.linear || motion.angular ? "MOVING" : "READY",
                motion.linear || motion.angular ? "moving" : "ready");
     }
@@ -228,7 +257,7 @@ CONTROL_PAGE = r"""<!doctype html>
             "Content-Type": "application/json",
             "X-Control-Token": ACCESS_TOKEN
           },
-          body: JSON.stringify({...motion, sequence: requestSequence}),
+          body: JSON.stringify({...motion, speed_scale: speedScale(), sequence: requestSequence}),
           cache: "no-store",
           keepalive: forceStop
         });
@@ -277,6 +306,9 @@ CONTROL_PAGE = r"""<!doctype html>
     }
 
     window.addEventListener("keydown", event => {
+      if (event.target === speedEl && [
+        "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"
+      ].includes(event.code)) return;
       const code = keyAlias[event.code] || event.code;
       if (code === "Space") {
         event.preventDefault();
@@ -290,6 +322,9 @@ CONTROL_PAGE = r"""<!doctype html>
     });
 
     window.addEventListener("keyup", event => {
+      if (event.target === speedEl && [
+        "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"
+      ].includes(event.code)) return;
       const code = keyAlias[event.code] || event.code;
       if (["KeyW", "KeyA", "KeyS", "KeyD"].includes(code)) {
         event.preventDefault();
@@ -313,6 +348,10 @@ CONTROL_PAGE = r"""<!doctype html>
     });
 
     document.getElementById("stop").addEventListener("click", emergencyStop);
+    speedEl.addEventListener("input", () => {
+      renderKeys();
+      if (active.size > 0) postMotion(false);
+    });
     window.addEventListener("blur", emergencyStop);
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) emergencyStop();
@@ -355,6 +394,7 @@ class SafeMotionController:
 
         self._linear_direction = 0
         self._angular_direction = 0
+        self._speed_scale = 0.30
         self._last_heartbeat = 0.0
         self._last_sequence = -1
         self._last_error: Optional[str] = None
@@ -376,16 +416,24 @@ class SafeMotionController:
         self._worker.start()
         return mode_result
 
-    def update(self, linear: int, angular: int, sequence: int) -> bool:
+    def update(
+            self,
+            linear: int,
+            angular: int,
+            speed_scale: float,
+            sequence: int) -> bool:
         """更新浏览器方向；返回 False 表示请求序号过旧、已被忽略。"""
         if linear not in (-1, 0, 1) or angular not in (-1, 0, 1):
             raise ValueError("linear and angular must be -1, 0, or 1")
+        if not math.isfinite(speed_scale) or not 0.10 <= speed_scale <= 1.0:
+            raise ValueError("speed_scale must be between 0.10 and 1.0")
         with self._state_lock:
             if sequence <= self._last_sequence:
                 return False
             self._last_sequence = sequence
             self._linear_direction = linear
             self._angular_direction = angular
+            self._speed_scale = speed_scale
             self._last_heartbeat = time.monotonic()
             self._last_error = None
         self._wake_event.set()
@@ -411,6 +459,9 @@ class SafeMotionController:
             return {
                 "linear_direction": self._linear_direction,
                 "angular_direction": self._angular_direction,
+                "speed_scale": self._speed_scale,
+                "linear_speed": self._linear_direction * self.linear_speed * self._speed_scale,
+                "angular_speed": self._angular_direction * self.angular_speed * self._speed_scale,
                 "heartbeat_age": age,
                 "last_sequence": self._last_sequence,
                 "last_error": self._last_error,
@@ -446,9 +497,9 @@ class SafeMotionController:
         if last_error is not None:
             raise RuntimeError("zero velocity failed: {}".format(last_error))
 
-    def _send_motion(self, linear: int, angular: int) -> None:
-        vx = linear * self.linear_speed
-        vw = angular * self.angular_speed
+    def _send_motion(self, linear: int, angular: int, speed_scale: float) -> None:
+        vx = linear * self.linear_speed * speed_scale
+        vw = angular * self.angular_speed * speed_scale
         with self._send_lock:
             result = self.client.robot_motion(vx=vx, vy=0.0, vw=vw)
         if self._rejected(result):
@@ -460,6 +511,7 @@ class SafeMotionController:
             with self._state_lock:
                 linear = self._linear_direction
                 angular = self._angular_direction
+                speed_scale = self._speed_scale
                 heartbeat_age = time.monotonic() - self._last_heartbeat
 
                 watchdog_expired = (
@@ -476,7 +528,7 @@ class SafeMotionController:
             moving = linear != 0 or angular != 0
             try:
                 if moving:
-                    self._send_motion(linear, angular)
+                    self._send_motion(linear, angular, speed_scale)
                 elif was_moving or watchdog_expired:
                     self._send_zero(repeat=5)
             except Exception as exc:
@@ -505,10 +557,19 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "invalid token"})
             return
         if parsed.path == "/":
-            page = CONTROL_PAGE.replace(
-                "__ACCESS_TOKEN__",
-                json.dumps(self.server.access_token),
-            ).encode("utf-8")
+            page = (
+                CONTROL_PAGE
+                .replace("__ACCESS_TOKEN__", json.dumps(self.server.access_token))
+                .replace(
+                    "__MAX_LINEAR_SPEED__",
+                    repr(self.server.controller.linear_speed),
+                )
+                .replace(
+                    "__MAX_ANGULAR_SPEED__",
+                    repr(self.server.controller.angular_speed),
+                )
+                .encode("utf-8")
+            )
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(page)))
@@ -532,6 +593,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 accepted = self.server.controller.update(
                     linear=int(payload["linear"]),
                     angular=int(payload["angular"]),
+                    speed_scale=float(payload["speed_scale"]),
                     sequence=int(payload["sequence"]),
                 )
                 self._send_json(HTTPStatus.OK, {"accepted": accepted})
@@ -652,17 +714,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--web-port", type=int, default=8765, help="网页监听端口")
     parser.add_argument("--access-token", default=None, help="可选固定网页访问令牌")
-    parser.add_argument("--linear-speed", type=float, default=0.03)
-    parser.add_argument("--angular-speed", type=float, default=0.05)
+    parser.add_argument(
+        "--linear-speed",
+        type=float,
+        default=0.10,
+        help="网页 100%% 档位对应的最大线速度，默认 0.10m/s",
+    )
+    parser.add_argument(
+        "--angular-speed",
+        type=float,
+        default=0.20,
+        help="网页 100%% 档位对应的最大角速度，默认 0.20rad/s",
+    )
     parser.add_argument("--watchdog", type=float, default=0.30)
     return parser
 
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if not 0.0 < args.linear_speed <= 0.05:
-        parser.error("--linear-speed 必须在 (0, 0.05] 范围内")
-    if not 0.0 < args.angular_speed <= 0.10:
-        parser.error("--angular-speed 必须在 (0, 0.10] 范围内")
+    if not 0.0 < args.linear_speed <= 0.20:
+        parser.error("--linear-speed 必须在 (0, 0.20] 范围内")
+    if not 0.0 < args.angular_speed <= 0.40:
+        parser.error("--angular-speed 必须在 (0, 0.40] 范围内")
     if not 0.20 <= args.watchdog <= 0.60:
         parser.error("--watchdog 必须在 [0.20, 0.60] 范围内")
     if not 1 <= args.web_port <= 65535:
@@ -676,7 +748,7 @@ def main() -> int:
 
     print("Jaten 浏览器键盘遥控")
     print("底盘: http://{}:{}".format(args.chassis_host, args.chassis_port))
-    print("线速度: {:.3f}m/s，角速度: {:.3f}rad/s，看门狗: {:.2f}s".format(
+    print("速度上限: 线速度 {:.3f}m/s，角速度 {:.3f}rad/s；看门狗: {:.2f}s".format(
         args.linear_speed,
         args.angular_speed,
         args.watchdog,
