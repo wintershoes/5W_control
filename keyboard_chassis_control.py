@@ -23,7 +23,7 @@ SSH 终端只能收到字符，无法可靠收到按键松开事件。本程序�
 
 实际启动：
 
-    python3 keyboard_chassis_control.py --execute
+    python3 keyboard_chassis_control.py --execute --browser-host 192.168.31.232
 
 然后在 Windows 浏览器打开程序打印的 URL，例如：
 
@@ -34,6 +34,7 @@ SSH 终端只能收到字符，无法可靠收到按键松开事件。本程序�
 """
 
 import argparse
+import ipaddress
 import json
 import secrets
 import signal
@@ -589,19 +590,52 @@ class ControlHttpServer(ThreadingHTTPServer):
         self.access_token = access_token
 
 
-def discover_local_ip() -> str:
-    """尽量获得浏览器可访问的上位机局域网地址。"""
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def _same_ipv4_subnet(left: str, right: str, prefix: int = 24) -> bool:
+    """判断两个 IPv4 地址是否位于同一子网。"""
     try:
-        probe.connect(("192.168.26.22", 8888))
-        return probe.getsockname()[0]
+        network = ipaddress.ip_network("{}/{}".format(left, prefix), strict=False)
+        return ipaddress.ip_address(right) in network
+    except ValueError:
+        return False
+
+
+def discover_browser_ip(chassis_host: str) -> str:
+    """优先选择不在底盘内部子网中的上位机地址。"""
+    candidates = []
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            candidates.append(info[4][0])
     except OSError:
+        pass
+
+    # UDP connect 不会真正发送数据，只用于询问内核访问目标时会选择哪个本机地址。
+    for target, port in [("8.8.8.8", 80), (chassis_host, 8888)]:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            return socket.gethostbyname(socket.gethostname())
+            probe.connect((target, port))
+            candidates.append(probe.getsockname()[0])
         except OSError:
-            return "<上位机IP>"
-    finally:
-        probe.close()
+            pass
+        finally:
+            probe.close()
+
+    unique = []
+    for candidate in candidates:
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if address.is_loopback or address.is_link_local or candidate in unique:
+            continue
+        unique.append(candidate)
+
+    external = [ip for ip in unique if not _same_ipv4_subnet(ip, chassis_host)]
+    if external:
+        return external[0]
+    if unique:
+        return unique[0]
+    return "<上位机可访问IP>"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -611,6 +645,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chassis-port", type=int, default=8888)
     parser.add_argument("--authorization", default=None, help="可选底盘 Authorization")
     parser.add_argument("--bind", default="0.0.0.0", help="网页监听地址")
+    parser.add_argument(
+        "--browser-host",
+        default=None,
+        help="打印给浏览器访问的上位机 IP；例如 192.168.31.232",
+    )
     parser.add_argument("--web-port", type=int, default=8765, help="网页监听端口")
     parser.add_argument("--access-token", default=None, help="可选固定网页访问令牌")
     parser.add_argument("--linear-speed", type=float, default=0.03)
@@ -679,10 +718,15 @@ def main() -> int:
         except Exception as stop_exc:
             print("警告：启动失败后的零速度请求失败:", stop_exc)
         return 1
-    local_ip = discover_local_ip()
+    browser_host = args.browser_host or discover_browser_ip(args.chassis_host)
     print("MANUAL 模式已确认:", mode_result)
+    print("网页监听: {}:{}".format(args.bind, args.web_port))
     print("浏览器控制地址:")
-    print("http://{}:{}/?token={}".format(local_ip, args.web_port, access_token))
+    print("http://{}:{}/?token={}".format(
+        browser_host,
+        args.web_port,
+        access_token,
+    ))
     print("Ctrl+C 退出；退出时会重复发送零速度。")
 
     def interrupt(_signum: int, _frame: object) -> None:

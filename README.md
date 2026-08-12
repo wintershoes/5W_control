@@ -30,10 +30,15 @@ python3 keyboard_chassis_control.py
 确认现场安全后，在上位机启动控制服务：
 
 ```bash
-python3 keyboard_chassis_control.py --execute
+python3 keyboard_chassis_control.py \
+  --execute \
+  --browser-host 192.168.31.232
 ```
 
-程序会打印一个包含随机访问令牌的地址。在 Windows 浏览器打开该地址后：
+`--browser-host` 是 Windows 能访问的上位机局域网地址，只影响程序打印的浏览器 URL；
+底盘控制仍通过默认的 `192.168.26.22` 进行。省略该参数时程序会自动选择一个不在底盘
+内部 `192.168.26.x` 子网中的地址。程序会打印一个包含随机访问令牌的地址。在 Windows
+浏览器打开该地址后：
 
 - 按住 `W/S` 或上下方向键：前进/后退；松开立即停止。
 - 按住 `A/D` 或左右方向键：左转/右转；松开立即停止。
