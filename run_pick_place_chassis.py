@@ -28,9 +28,9 @@ python3 run_pick_place_chassis.py --execute --mode both \
     --workpiece-pick-station PICK_A --workpiece-place-station PLACE_A \
     --disk-pick-station PICK_USB --disk-place-station PLACE_USB
 
-注意：当前导航完成判定基于 AMCL 位姿稳定，不能区分正常到站和受阻后停止。
-自动导航中的任务取消接口也尚未确认。执行前必须人工确认急停、驱动使能、底盘
-无故障、站点名称和路网正确，并保证机器人周围及整条路线安全。
+注意：导航通过 PathTrackState 判断目标节点是否真正到达，并持续打印当前节点、
+目标节点、当前边和剩余边数。自动导航取消接口尚未确认；超时后程序会报错停止，
+不会自动重发。执行前必须确认急停、驱动使能、路网和整条路线安全。
 """
 
 import argparse
@@ -290,4 +290,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

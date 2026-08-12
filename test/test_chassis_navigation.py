@@ -4,9 +4,10 @@
 
 调用方法：
 1. 使用 ChassisReadAdapter 读取 /move_base/amcl_pose 和当前导航源。
-2. 使用 ChassisHttpClient.dispatch_goal_node_name()，通过底盘 jaten-api 的
-   POST /command?cmd=<DispatchGoalNodeName JSON> 下发站点名称。
-3. 请求格式与底盘网页右键站点导航一致：
+2. 使用 ChassisAdapter.navigate_to_station() 通过底盘 jaten-api 下发站点名称。
+3. 订阅 /path_sequence_executor/out/path_track_state，持续打印路网进度，并在
+   reached_node_id == end_node_id 且剩余边为 0 时确认导航成功。
+4. 请求格式与底盘网页右键站点导航一致：
    {"method":"DispatchGoalNodeName","id":"1","params":{"name":["NP1"]}}
 
 参数：
@@ -15,14 +16,15 @@
 --host                    底盘 API 地址，默认 192.168.26.22。
 --port                    底盘 API 端口，默认 8888。
 --token                   可选的 HTTP Authorization 值。
+--timeout                 任务启动后的导航超时，默认 120 秒。
+--start-timeout           等待路网状态进入执行中的超时，默认 15 秒。
 --execute                 实际下发导航；不提供时仅构造并打印请求。
 
 示例：
 python3 test_chassis_navigation.py --node NP1
 python3 test_chassis_navigation.py --node NP1 --execute
 
-注意：HTTP 返回只表示命令已被处理，不代表机器人已经到站。执行前确认底盘处于
-自动模式、驱动已使能、急停已释放、当前路网正确且路径无障碍。
+注意：HTTP 返回只表示命令已被处理；程序以 PathTrackState 确认最终到站。
 """
 
 import argparse
@@ -30,7 +32,7 @@ import json
 
 import rospy
 
-from chassis_adapter import ChassisHttpClient, ChassisReadAdapter
+from chassis_adapter import ChassisAdapter, ChassisHttpClient, ChassisReadAdapter
 
 
 def main():
@@ -41,6 +43,8 @@ def main():
     parser.add_argument("--host", default="192.168.26.22", help="底盘 API 主机地址")
     parser.add_argument("--port", type=int, default=8888, help="底盘 API 端口")
     parser.add_argument("--token", default=None, help="可选 Authorization 值")
+    parser.add_argument("--timeout", type=float, default=120.0, help="导航执行超时（秒）")
+    parser.add_argument("--start-timeout", type=float, default=15.0, help="等待任务启动超时（秒）")
     args = parser.parse_args()
 
     rospy.init_node("test_chassis_station_navigation", anonymous=True)
@@ -71,12 +75,25 @@ def main():
         print("\nRefusing to navigate because pose interface is unavailable:", readiness.get("reasons"))
         return
 
-    print("\nWarning: confirm automatic mode, driver enable, emergency stop and a clear route.")
-    result = client.dispatch_goal_node_name(args.node, args.request_id)
-    print("dispatch_result:", result)
-    print("\nThe HTTP response only confirms command handling, not arrival at the station.")
-    rospy.sleep(1.0)
-    print("nav_source_after_dispatch:", reader.get_nav_source_used())
+    print("\nWarning: confirm driver enable, emergency stop and a clear route.")
+    chassis = ChassisAdapter(
+        host=args.host,
+        port=args.port,
+        token=args.token,
+        reader=reader,
+        http_client=client,
+    )
+    success = chassis.navigate_to_station(
+        args.node,
+        timeout=args.timeout,
+        initial_check_time=args.start_timeout,
+        max_retries=1,
+        request_id=args.request_id,
+    )
+    print("navigation_success:", success)
+    print("nav_source_after:", reader.get_nav_source_used())
+    if not success:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

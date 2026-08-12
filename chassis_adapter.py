@@ -19,6 +19,8 @@
 
 import json
 import math
+import struct
+import threading
 import time
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
@@ -28,6 +30,121 @@ from urllib.request import Request, urlopen
 import rospy
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from std_msgs.msg import String
+
+
+PATH_TRACK_TOPIC = "/path_sequence_executor/out/path_track_state"
+
+
+def _read_ros_string(data: bytes, offset: int):
+    """从 ROS1 序列化数据中读取一个 UTF-8 string。"""
+    (length,) = struct.unpack_from("<I", data, offset)
+    offset += 4
+    end = offset + length
+    if end > len(data):
+        raise ValueError("truncated ROS string")
+    return data[offset:end].decode("utf-8", errors="replace"), end
+
+
+def decode_path_track_state(data: bytes) -> Dict[str, Any]:
+    """解析 jaten_msgs/PathTrackState，不要求本机安装 jaten_msgs。
+
+    字段布局来自底盘上的 `rosmsg show jaten_msgs/PathTrackState`。使用
+    `rospy.AnyMsg` 是为了让缺少厂商消息包的上位机仍能读取导航反馈。
+    """
+    offset = 0
+    seq, stamp_secs, stamp_nsecs = struct.unpack_from("<III", data, offset)
+    offset += 12
+    frame_id, offset = _read_ros_string(data, offset)
+    (last_request_id,) = struct.unpack_from("<H", data, offset)
+    offset += 2
+    (last_request_op,) = struct.unpack_from("<B", data, offset)
+    offset += 1
+    last_request_edge_num, last_request_response_code = struct.unpack_from(
+        "<II", data, offset
+    )
+    offset += 8
+    last_request_response_msg, offset = _read_ros_string(data, offset)
+    (
+        reached_node_id,
+        last_node_id,
+        next_node_id,
+        end_node_id,
+        current_edge_id,
+    ) = struct.unpack_from("<iiiii", data, offset)
+    offset += 20
+    (num_edge_remain,) = struct.unpack_from("<I", data, offset)
+    offset += 4
+    (edge_count,) = struct.unpack_from("<I", data, offset)
+    offset += 4
+    if offset + edge_count * 4 > len(data):
+        raise ValueError("truncated edges_remain")
+    edges_remain = list(struct.unpack_from(
+        "<{}i".format(edge_count), data, offset
+    )) if edge_count else []
+    return {
+        "seq": seq,
+        "stamp_secs": stamp_secs,
+        "stamp_nsecs": stamp_nsecs,
+        "frame_id": frame_id,
+        "last_request_id": last_request_id,
+        "last_request_op": last_request_op,
+        "last_request_edge_num": last_request_edge_num,
+        "last_request_response_code": last_request_response_code,
+        "last_request_response_msg": last_request_response_msg,
+        "reached_node_id": reached_node_id,
+        "last_node_id": last_node_id,
+        "next_node_id": next_node_id,
+        "end_node_id": end_node_id,
+        "current_edge_id": current_edge_id,
+        "num_edge_remain": num_edge_remain,
+        "edges_remain": edges_remain,
+    }
+
+
+class PathTrackFeedbackMonitor:
+    """订阅路网执行状态，并为同步导航调用提供线程安全的状态快照。"""
+
+    def __init__(self, topic: str = PATH_TRACK_TOPIC):
+        self.topic = topic
+        self._condition = threading.Condition()
+        self._state = None
+        self._generation = 0
+        self._subscriber = rospy.Subscriber(
+            topic, rospy.AnyMsg, self._callback, queue_size=20
+        )
+
+    def _callback(self, msg: rospy.AnyMsg) -> None:
+        try:
+            state = decode_path_track_state(msg._buff)
+        except (ValueError, struct.error) as exc:
+            rospy.logerr_throttle(5.0, "解析 %s 失败: %s", self.topic, exc)
+            return
+        with self._condition:
+            self._state = state
+            self._generation += 1
+            self._condition.notify_all()
+
+    def snapshot(self):
+        """返回 `(generation, state)`；state 为副本，避免回调并发修改。"""
+        with self._condition:
+            state = dict(self._state) if self._state is not None else None
+            if state is not None:
+                state["edges_remain"] = list(state["edges_remain"])
+            return self._generation, state
+
+    def wait_for_update(self, generation: int, timeout: float):
+        """等待 generation 之后的新消息，超时仍返回当前快照。"""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._condition:
+            while self._generation <= generation and not rospy.is_shutdown():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                self._condition.wait(remaining)
+            state = dict(self._state) if self._state is not None else None
+            if state is not None:
+                state["edges_remain"] = list(state["edges_remain"])
+            return self._generation, state
 
 
 def quat_to_yaw(qx: float, qy: float, qz: float, qw: float) -> float:
@@ -275,7 +392,8 @@ class ChassisAdapter:
             http_timeout: float = 3.0,
             pose_timeout: float = 2.0,
             reader: Optional[ChassisReadAdapter] = None,
-            http_client: Optional[ChassisHttpClient] = None):
+            http_client: Optional[ChassisHttpClient] = None,
+            path_feedback: Optional[PathTrackFeedbackMonitor] = None):
         self.reader = reader or ChassisReadAdapter(wait_timeout=pose_timeout)
         self.http = http_client or ChassisHttpClient(
             host=host,
@@ -283,6 +401,7 @@ class ChassisAdapter:
             token=token,
             timeout=http_timeout,
         )
+        self.path_feedback = path_feedback or PathTrackFeedbackMonitor()
 
     # ==================== 只读状态 ====================
 
@@ -547,74 +666,104 @@ class ChassisAdapter:
 
     # ==================== 路网站点导航 ====================
 
-    def _wait_navigation_started(
+    @staticmethod
+    def _path_summary(state: Dict[str, Any]) -> str:
+        return (
+            "已到节点={reached_node_id}, 上一节点={last_node_id}, "
+            "下一节点={next_node_id}, 目标节点={end_node_id}, "
+            "当前边={current_edge_id}, 剩余边={num_edge_remain}, "
+            "剩余边列表={edges_remain}"
+        ).format(**state)
+
+    @staticmethod
+    def _path_task_active(state: Dict[str, Any]) -> bool:
+        return (
+            state["current_edge_id"] != 0
+            or state["num_edge_remain"] > 0
+            or bool(state["edges_remain"])
+            or state["reached_node_id"] != state["end_node_id"]
+        )
+
+    @staticmethod
+    def _path_task_succeeded(state: Dict[str, Any]) -> bool:
+        return (
+            state["last_request_response_code"] == 0
+            and state["reached_node_id"] == state["end_node_id"]
+            and state["num_edge_remain"] == 0
+            and state["current_edge_id"] == 0
+            and not state["edges_remain"]
+        )
+
+    def _wait_path_navigation_result(
             self,
-            initial_pose: Dict[str, float],
+            baseline_generation: int,
+            baseline_state: Optional[Dict[str, Any]],
+            start_timeout: float,
             timeout: float,
-            check_interval: float,
-            position_threshold: float,
-            angle_threshold: float) -> bool:
-        """检测站点任务下发后底盘是否发生了可观测运动。"""
-        start_time = time.monotonic()
-        while time.monotonic() - start_time < timeout and not rospy.is_shutdown():
-            pose = self.get_current_pose()
-            if pose is not None:
-                moved = math.hypot(
-                    pose["x"] - initial_pose["x"],
-                    pose["y"] - initial_pose["y"],
-                )
-                rotated = abs(normalize_angle(
-                    pose["theta"] - initial_pose["theta"]
-                ))
-                if moved > position_threshold or rotated > angle_threshold:
-                    rospy.loginfo(
-                        "检测到导航开始: 位移 %.3fm，转角 %.3frad",
-                        moved, rotated,
-                    )
-                    return True
-            rospy.sleep(check_interval)
-        return False
+            progress_interval: float) -> bool:
+        """等待路网任务启动和完成，成功条件来自现场确认的 PathTrackState。"""
+        started = False
+        start_deadline = time.monotonic() + start_timeout
+        task_deadline = None
+        generation = baseline_generation
+        state = baseline_state
+        last_state_key = None
+        last_progress_log = 0.0
 
-    def _wait_navigation_stable(
-            self,
-            timeout: float,
-            stable_time: float,
-            check_interval: float,
-            position_threshold: float,
-            angle_threshold: float) -> bool:
-        """位置和朝向连续稳定指定时间后，认为站点导航结束。"""
-        pose = self.get_current_pose()
-        if pose is None:
-            return False
+        while not rospy.is_shutdown():
+            now = time.monotonic()
+            deadline = task_deadline if started else start_deadline
+            if now >= deadline:
+                if started:
+                    rospy.logerr("导航执行超时；最后状态: %s", self._path_summary(state))
+                else:
+                    rospy.logerr("未在 %.1fs 内观察到新的路网导航任务", start_timeout)
+                return False
 
-        anchor_pose = pose
-        last_change_time = time.monotonic()
-        start_time = time.monotonic()
-
-        while time.monotonic() - start_time < timeout and not rospy.is_shutdown():
-            rospy.sleep(check_interval)
-            pose = self.get_current_pose()
-            if pose is None:
+            generation, state = self.path_feedback.wait_for_update(
+                generation, min(0.5, max(0.0, deadline - now))
+            )
+            if state is None:
                 continue
 
-            moved = math.hypot(
-                pose["x"] - anchor_pose["x"],
-                pose["y"] - anchor_pose["y"],
+            state_key = (
+                state["reached_node_id"], state["last_node_id"],
+                state["next_node_id"], state["end_node_id"],
+                state["current_edge_id"], state["num_edge_remain"],
+                tuple(state["edges_remain"]),
             )
-            rotated = abs(normalize_angle(
-                pose["theta"] - anchor_pose["theta"]
-            ))
-            if moved > position_threshold or rotated > angle_threshold:
-                anchor_pose = pose
-                last_change_time = time.monotonic()
+            changed_from_baseline = baseline_state is None or any(
+                state.get(key) != baseline_state.get(key)
+                for key in (
+                    "reached_node_id", "last_node_id", "next_node_id",
+                    "end_node_id", "current_edge_id", "num_edge_remain",
+                    "edges_remain", "last_request_response_code",
+                    "last_request_response_msg",
+                )
+            )
+            response_code = state["last_request_response_code"]
+            if changed_from_baseline and response_code != 0:
+                rospy.logerr(
+                    "路网导航反馈失败: code=%d, message=%s",
+                    response_code, state["last_request_response_msg"],
+                )
+                return False
+            if not started and changed_from_baseline and self._path_task_active(state):
+                started = True
+                task_deadline = time.monotonic() + timeout
+                rospy.loginfo("导航任务已启动: %s", self._path_summary(state))
 
-            stable_duration = time.monotonic() - last_change_time
-            rospy.loginfo(
-                "导航监控: x=%.3f y=%.3f theta=%.3f，稳定 %.1fs",
-                pose["x"], pose["y"], pose["theta"], stable_duration,
-            )
-            if stable_duration >= stable_time:
+            now = time.monotonic()
+            if state_key != last_state_key or now - last_progress_log >= progress_interval:
+                phase = "执行中" if started else "等待启动"
+                rospy.loginfo("导航%s: %s", phase, self._path_summary(state))
+                last_state_key = state_key
+                last_progress_log = now
+
+            if started and self._path_task_succeeded(state):
+                rospy.loginfo("导航成功到达目标节点: %s", self._path_summary(state))
                 return True
+
         return False
 
     def navigate_to_station(
@@ -622,18 +771,14 @@ class ChassisAdapter:
             station_name: str,
             timeout: float = 120.0,
             initial_check_time: float = 15.0,
-            stable_time: float = 5.0,
-            check_interval: float = 0.5,
-            position_threshold: float = 0.01,
-            angle_threshold: float = 0.03,
+            progress_interval: float = 5.0,
             max_retries: int = 3,
             extra_forward: float = 0.0,
             request_id: str = "1") -> bool:
-        """切到 AUTO，按路网站点名导航，并通过 AMCL 变化等待任务结束。
+        """切到 AUTO，按站点名导航，并等待 PathTrackState 确认到达。
 
-        HTTP 成功只说明命令被接收，所以这里沿用旧程序的两阶段监控：先确认机器人
-        发生运动，再等待位置和朝向连续稳定。由于当前没有可读的厂商导航结果消息，
-        “稳定”仍可能是到站、受阻或导航失败，正式运行时需保留超时和人工急停。
+        HTTP 返回只代表命令被接收。真正成功要求新任务已经出现，随后满足：
+        reached_node_id == end_node_id、剩余边为 0、当前边为 0。
         """
         station_name = station_name.strip()
         if not station_name:
@@ -642,10 +787,15 @@ class ChassisAdapter:
             raise ValueError("max_retries must be greater than zero")
 
         for attempt in range(1, max_retries + 1):
-            initial_pose = self.get_current_pose()
-            if initial_pose is None:
-                rospy.logerr("无法读取导航前位姿（尝试 %d/%d）", attempt, max_retries)
-                continue
+            baseline_generation, baseline_state = self.path_feedback.snapshot()
+            if baseline_state is None:
+                baseline_generation, baseline_state = self.path_feedback.wait_for_update(
+                    baseline_generation, 2.0
+                )
+            if baseline_state is None:
+                rospy.logerr("无法读取 %s，拒绝下发导航", PATH_TRACK_TOPIC)
+                return False
+            rospy.loginfo("导航前路网状态: %s", self._path_summary(baseline_state))
 
             try:
                 self.ensure_auto_mode(request_id=request_id)
@@ -668,25 +818,18 @@ class ChassisAdapter:
                 "已下发站点导航 %s（尝试 %d/%d）",
                 station_name, attempt, max_retries,
             )
-            if not self._wait_navigation_started(
-                    initial_pose=initial_pose,
-                    timeout=initial_check_time,
-                    check_interval=check_interval,
-                    position_threshold=position_threshold,
-                    angle_threshold=angle_threshold):
-                rospy.logwarn("未检测到导航启动（尝试 %d/%d）", attempt, max_retries)
-                continue
-
-            if not self._wait_navigation_stable(
+            if not self._wait_path_navigation_result(
+                    baseline_generation=baseline_generation,
+                    baseline_state=baseline_state,
+                    start_timeout=initial_check_time,
                     timeout=timeout,
-                    stable_time=stable_time,
-                    check_interval=check_interval,
-                    position_threshold=position_threshold,
-                    angle_threshold=angle_threshold):
-                rospy.logwarn("导航未在超时时间内稳定（尝试 %d/%d）", attempt, max_retries)
-                continue
+                    progress_interval=progress_interval):
+                # 尚未确认自动导航取消接口；任务启动或超时后不自动重发，避免
+                # 同一目标被重复下发。调用方可检查现场后自行决定是否重试。
+                rospy.logerr("站点 %s 导航未成功，停止自动重试", station_name)
+                return False
 
-            rospy.loginfo("站点 %s 导航结束", station_name)
+            rospy.loginfo("站点 %s 导航已确认成功", station_name)
             if abs(extra_forward) > 0.001:
                 return self.move_relative(forward=extra_forward)
             return True

@@ -14,7 +14,7 @@ source ~/kuavo_ros_application/devel/setup.bash
 
 ## 文件说明
 
-- `chassis_adapter.py`：唯一的底盘接口文件，包含 ROS 位姿读取、HTTP 模式/运动/导航命令、站点导航等待、AMCL 闭环相对移动和旋转。
+- `chassis_adapter.py`：唯一的底盘接口文件，包含 ROS 位姿读取、HTTP 模式/运动/导航命令、PathTrackState 到站反馈、AMCL 闭环相对移动和旋转。
 - `run_pick_place_chassis.py`：底盘抓放运行主程序。支持普通工件、U 盘或依次运行两套流程；抓取和放置动作当前留空。
 - `keyboard_chassis_control.py`：浏览器键盘遥控。按下立即移动、松开立即停止，并由服务端看门狗处理失焦或网络中断。
 - `test/`：模式切换、前后移动、旋转和站点导航测试程序。
@@ -74,4 +74,4 @@ python3 run_pick_place_chassis.py \
 
 ## 安全说明
 
-默认 dry-run 不会控制机器人。实际执行前必须确认急停可用、驱动已使能、底盘无故障、当前地图和路网正确，并保证整个路径无人员和障碍。当前自动导航完成判定基于 AMCL 位姿稳定，尚不能可靠区分正常到站与受阻停止。
+默认 dry-run 不会控制机器人。实际执行前必须确认急停可用、驱动已使能、底盘无故障、当前地图和路网正确，并保证整个路径无人员和障碍。自动导航只有在 PathTrackState 报告已到目标节点、当前边和剩余边均为 0 时才返回成功；受阻后不会误判到站，但当前仍以任务超时作为最终失败条件。
