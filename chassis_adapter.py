@@ -5,7 +5,9 @@
 本文件只负责底盘，组合两个已经确认的接口：
 
 1. ROS `/move_base/amcl_pose`：读取地图坐标系下的 x、y、theta。
-2. 底盘 HTTP `/command?cmd=...`：切换模式、发送 RobotMotion、按站点名导航。
+2. 底盘 HTTP `/command?cmd=...`：切换模式、发送 RobotMotion、按站点名导航，
+   以及使用 SetRotationTheta 指定地图坐标系绝对目标朝向。
+3. ROS `PathTrackState` 与 `RotationStatus`：分别确认到站和原生闭环旋转完成。
 
 跨区域导航只保留一种方式：预先在底盘路网中配置站点，再调用
 `navigate_to_station()`。旧程序的 task_id 和任意 x/y/theta 导航不再保留。
@@ -33,6 +35,15 @@ from std_msgs.msg import String
 
 
 PATH_TRACK_TOPIC = "/path_sequence_executor/out/path_track_state"
+ROTATION_STATUS_TOPIC = "/rotation_dispatch/rotation_status"
+ROTATION_STATUS_WAIT = 0
+ROTATION_STATUS_SUCCESS = 1
+ROTATION_STATUS_RUNNING = 2
+ROTATION_STATUS_NAMES = {
+    ROTATION_STATUS_WAIT: "WAIT",
+    ROTATION_STATUS_SUCCESS: "SUCCESS",
+    ROTATION_STATUS_RUNNING: "RUNNING",
+}
 
 
 def _read_ros_string(data: bytes, offset: int):
@@ -146,6 +157,57 @@ class PathTrackFeedbackMonitor:
                 state["edges_remain"] = list(state["edges_remain"])
             return self._generation, state
 
+
+def decode_rotation_status(data: bytes) -> Dict[str, Any]:
+    """解析 jaten_msgs/RotationStatus，不要求上位机安装 jaten_msgs。"""
+    if len(data) < 5:
+        raise ValueError("RotationStatus data is shorter than 5 bytes")
+    current_request_id, rotation_status = struct.unpack_from("<IB", data, 0)
+    return {
+        "current_request_id": current_request_id,
+        "rotation_status": rotation_status,
+        "status_name": ROTATION_STATUS_NAMES.get(rotation_status, "UNKNOWN"),
+    }
+
+
+class RotationStatusFeedbackMonitor:
+    """订阅底盘原生闭环旋转状态，并提供线程安全的状态快照。"""
+
+    def __init__(self, topic: str = ROTATION_STATUS_TOPIC):
+        self.topic = topic
+        self._condition = threading.Condition()
+        self._state = None
+        self._generation = 0
+        self._subscriber = rospy.Subscriber(
+            topic, rospy.AnyMsg, self._callback, queue_size=20
+        )
+
+    def _callback(self, msg: rospy.AnyMsg) -> None:
+        try:
+            state = decode_rotation_status(msg._buff)
+        except (ValueError, struct.error) as exc:
+            rospy.logerr_throttle(5.0, "解析 %s 失败: %s", self.topic, exc)
+            return
+        with self._condition:
+            self._state = state
+            self._generation += 1
+            self._condition.notify_all()
+
+    def snapshot(self):
+        with self._condition:
+            state = dict(self._state) if self._state is not None else None
+            return self._generation, state
+
+    def wait_for_update(self, generation: int, timeout: float):
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._condition:
+            while self._generation <= generation and not rospy.is_shutdown():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                self._condition.wait(remaining)
+            state = dict(self._state) if self._state is not None else None
+            return self._generation, state
 
 def quat_to_yaw(qx: float, qy: float, qz: float, qw: float) -> float:
     """将 ROS 四元数转换为偏航角 theta。"""
@@ -363,6 +425,27 @@ class ChassisHttpClient:
             self.make_dispatch_goal_node_name_payload(node_name, request_id)
         )
 
+    @staticmethod
+    def make_set_rotation_theta_payload(
+            target_theta: float, request_id: int) -> Dict[str, Any]:
+        """构造底盘原生绝对朝向命令 SetRotationTheta。"""
+        if not math.isfinite(target_theta):
+            raise ValueError("target_theta must be finite")
+        if not (0 <= request_id <= 0x7FFFFFFF):
+            raise ValueError("request_id must be between 0 and 2147483647")
+        return {
+            "method": "SetRotationTheta",
+            "id": str(request_id),
+            "params": {"theta": float(target_theta)},
+        }
+
+    def set_rotation_theta(
+            self, target_theta: float, request_id: int) -> Dict[str, Any]:
+        """下发地图坐标系绝对目标朝向；完成结果需监听 RotationStatus。"""
+        return self.send_command(
+            self.make_set_rotation_theta_payload(target_theta, request_id)
+        )
+
     def stop(self, repeat: int = 3) -> None:
         """重复发送零速度，尽量确保手动运动停止。"""
         last_error = None
@@ -393,7 +476,8 @@ class ChassisAdapter:
             pose_timeout: float = 2.0,
             reader: Optional[ChassisReadAdapter] = None,
             http_client: Optional[ChassisHttpClient] = None,
-            path_feedback: Optional[PathTrackFeedbackMonitor] = None):
+            path_feedback: Optional[PathTrackFeedbackMonitor] = None,
+            rotation_feedback: Optional[RotationStatusFeedbackMonitor] = None):
         self.reader = reader or ChassisReadAdapter(wait_timeout=pose_timeout)
         self.http = http_client or ChassisHttpClient(
             host=host,
@@ -402,6 +486,9 @@ class ChassisAdapter:
             timeout=http_timeout,
         )
         self.path_feedback = path_feedback or PathTrackFeedbackMonitor()
+        self.rotation_feedback = (
+            rotation_feedback or RotationStatusFeedbackMonitor()
+        )
 
     # ==================== 只读状态 ====================
 
@@ -605,64 +692,129 @@ class ChassisAdapter:
     def rotate_relative(
             self,
             angle: float,
-            tolerance: float = 0.03,
-            max_iterations: int = 12,
-            angular_speed: float = 0.05,
-            max_step_angle: float = 0.15,
-            settle_time: float = 0.5) -> bool:
-        """根据 AMCL theta 闭环旋转；正值左转，负值右转。"""
-        if tolerance <= 0.0:
-            raise ValueError("tolerance must be greater than zero")
-        if angular_speed <= 0.0:
-            raise ValueError("angular_speed must be greater than zero")
-        if max_step_angle <= 0.0:
-            raise ValueError("max_step_angle must be greater than zero")
-
-        start_pose = self.get_current_pose()
-        if start_pose is None:
-            rospy.logerr("无法读取起始位姿，拒绝旋转")
+            timeout: float = 30.0,
+            request_id: Optional[int] = None) -> bool:
+        """使用底盘原生闭环相对旋转；正值左转，负值右转。"""
+        pose = self.get_current_pose()
+        if pose is None:
+            rospy.logerr("无法读取当前朝向，拒绝旋转")
             return False
-        target_theta = normalize_angle(start_pose["theta"] + angle)
+        target_theta = normalize_angle(pose["theta"] + angle)
+        return self.rotate_to_theta(
+            target_theta=target_theta,
+            timeout=timeout,
+            request_id=request_id,
+        )
 
-        try:
-            self.ensure_manual_mode()
-        except RuntimeError as exc:
-            rospy.logerr("切换手动模式失败，拒绝旋转: %s", exc)
-            return False
+    @staticmethod
+    def _new_rotation_request_id() -> int:
+        """生成兼容 Java int 与 ROS uint32 的正请求编号。"""
+        return int(time.time() * 1000) & 0x7FFFFFFF
 
-        for iteration in range(max_iterations):
-            pose = self.get_current_pose()
-            if pose is None:
-                rospy.sleep(settle_time)
+    def _wait_rotation_result(
+            self, baseline_generation: int, request_id: int,
+            timeout: float) -> bool:
+        """等待本次 request_id 的原生旋转状态变为 SUCCESS。"""
+        deadline = time.monotonic() + timeout
+        generation = baseline_generation
+        last_status = None
+        observed = False
+
+        while not rospy.is_shutdown():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                rospy.logerr(
+                    "闭环旋转超时: request_id=%d, last_status=%s",
+                    request_id, last_status,
+                )
+                return False
+
+            generation, state = self.rotation_feedback.wait_for_update(
+                generation, min(0.5, remaining)
+            )
+            if state is None or state["current_request_id"] != request_id:
                 continue
 
-            error = normalize_angle(target_theta - pose["theta"])
-            if abs(error) <= tolerance:
-                rospy.loginfo("旋转完成，最终角度误差 %.3frad", abs(error))
+            observed = True
+            status = state["rotation_status"]
+            if status != last_status:
+                rospy.loginfo(
+                    "闭环旋转状态: request_id=%d, status=%s(%d)",
+                    request_id, state["status_name"], status,
+                )
+                last_status = status
+            if status == ROTATION_STATUS_SUCCESS:
                 return True
 
-            pulse_angle = min(abs(error), max_step_angle)
-            velocity = angular_speed if error > 0.0 else -angular_speed
-            rospy.loginfo(
-                "旋转迭代 %d/%d: angle_error=%.3frad",
-                iteration + 1, max_iterations, error,
-            )
-            try:
-                self._send_velocity_pulse(
-                    vw=velocity,
-                    duration=pulse_angle / angular_speed,
-                )
-            except RuntimeError as exc:
-                rospy.logerr("旋转命令失败: %s", exc)
-                return False
-            rospy.sleep(settle_time)
+        if not observed:
+            rospy.logerr("未观察到闭环旋转请求 %d 的状态", request_id)
+        return False
 
-        final_pose = self.get_current_pose()
-        if final_pose is None:
+    def rotate_to_theta(
+            self,
+            target_theta: float,
+            timeout: float = 30.0,
+            request_id: Optional[int] = None) -> bool:
+        """旋转到地图坐标系绝对目标朝向，并等待底盘原生闭环完成。"""
+        if not math.isfinite(target_theta):
+            raise ValueError("target_theta must be finite")
+        if timeout <= 0.0:
+            raise ValueError("timeout must be greater than zero")
+        target_theta = normalize_angle(target_theta)
+        if request_id is None:
+            request_id = self._new_rotation_request_id()
+        if not (0 <= request_id <= 0x7FFFFFFF):
+            raise ValueError("request_id must be between 0 and 2147483647")
+
+        before_pose = self.get_current_pose()
+        if before_pose is None:
+            rospy.logerr("无法读取当前朝向，拒绝下发闭环旋转")
             return False
-        final_error = abs(normalize_angle(target_theta - final_pose["theta"]))
-        rospy.logerr("旋转未达到目标，最终角度误差 %.3frad", final_error)
-        return final_error <= tolerance
+        expected_turn = normalize_angle(target_theta - before_pose["theta"])
+        baseline_generation, _ = self.rotation_feedback.snapshot()
+
+        try:
+            self.ensure_auto_mode(request_id=str(request_id))
+            result = self.http.set_rotation_theta(target_theta, request_id)
+        except RuntimeError as exc:
+            rospy.logerr("闭环旋转命令异常: %s", exc)
+            return False
+        if self._command_rejected(result):
+            rospy.logerr("闭环旋转被拒绝: %s", result)
+            return False
+
+        rospy.loginfo(
+            "已下发闭环旋转: request_id=%d, current=%.3f, target=%.3f, "
+            "expected_turn=%.3f",
+            request_id, before_pose["theta"], target_theta, expected_turn,
+        )
+        success = self._wait_rotation_result(
+            baseline_generation=baseline_generation,
+            request_id=request_id,
+            timeout=timeout,
+        )
+        after_pose = self.get_current_pose()
+        if after_pose is not None:
+            rospy.loginfo(
+                "闭环旋转结束: theta=%.3f, error=%.3f",
+                after_pose["theta"],
+                abs(normalize_angle(target_theta - after_pose["theta"])),
+            )
+        return success
+
+    def rotate_to_angle(
+            self,
+            target_angle: float,
+            timeout: float = 30.0,
+            request_id: Optional[int] = None) -> bool:
+        """按角度制指定地图坐标系绝对目标朝向。"""
+        if not math.isfinite(target_angle):
+            raise ValueError("target_angle must be finite")
+        return self.rotate_to_theta(
+            target_theta=math.radians(target_angle),
+            timeout=timeout,
+            request_id=request_id,
+        )
 
     # ==================== 路网站点导航 ====================
 
@@ -774,17 +926,34 @@ class ChassisAdapter:
             progress_interval: float = 5.0,
             max_retries: int = 3,
             extra_forward: float = 0.0,
-            request_id: str = "1") -> bool:
-        """切到 AUTO，按站点名导航，并等待 PathTrackState 确认到达。
+            request_id: str = "1",
+            target_theta: Optional[float] = None,
+            target_angle: Optional[float] = None,
+            rotation_timeout: float = 30.0,
+            rotation_request_id: Optional[int] = None) -> bool:
+        """按站点名导航，可选在到站后闭环旋转到绝对目标朝向。
 
         HTTP 返回只代表命令被接收。真正成功要求新任务已经出现，随后满足：
         reached_node_id == end_node_id、剩余边为 0、当前边为 0。
+        target_theta 使用弧度，target_angle 使用角度制，二者都是地图坐标系
+        绝对朝向且不能同时提供。指定朝向后必须收到 RotationStatus SUCCESS，
+        之后才会执行可选的 extra_forward。
         """
         station_name = station_name.strip()
         if not station_name:
             raise ValueError("station_name must not be empty")
         if max_retries <= 0:
             raise ValueError("max_retries must be greater than zero")
+        if target_theta is not None and not math.isfinite(target_theta):
+            raise ValueError("target_theta must be finite")
+        if target_angle is not None and not math.isfinite(target_angle):
+            raise ValueError("target_angle must be finite")
+        if target_theta is not None and target_angle is not None:
+            raise ValueError("target_theta and target_angle are mutually exclusive")
+        if target_angle is not None:
+            target_theta = math.radians(target_angle)
+        if rotation_timeout <= 0.0:
+            raise ValueError("rotation_timeout must be greater than zero")
 
         for attempt in range(1, max_retries + 1):
             baseline_generation, baseline_state = self.path_feedback.snapshot()
@@ -830,6 +999,19 @@ class ChassisAdapter:
                 return False
 
             rospy.loginfo("站点 %s 导航已确认成功", station_name)
+            if target_theta is not None:
+                rospy.loginfo(
+                    "开始修正站点最终朝向: target_theta=%.3frad",
+                    target_theta,
+                )
+                if not self.rotate_to_theta(
+                        target_theta=target_theta,
+                        timeout=rotation_timeout,
+                        request_id=rotation_request_id):
+                    rospy.logerr(
+                        "已到达站点 %s，但最终朝向修正失败", station_name
+                    )
+                    return False
             if abs(extra_forward) > 0.001:
                 return self.move_relative(forward=extra_forward)
             return True

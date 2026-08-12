@@ -14,7 +14,7 @@ source ~/kuavo_ros_application/devel/setup.bash
 
 ## 文件说明
 
-- `chassis_adapter.py`：唯一的底盘接口文件，包含 ROS 位姿读取、HTTP 模式/运动/导航命令、PathTrackState 到站反馈、AMCL 闭环相对移动和旋转。
+- `chassis_adapter.py`：唯一的底盘接口文件，包含 ROS 位姿读取、HTTP 模式/运动/导航命令、PathTrackState 到站反馈、AMCL 闭环相对移动，以及 `SetRotationTheta + RotationStatus` 原生闭环旋转。
 - `run_pick_place_chassis.py`：底盘抓放运行主程序。支持普通工件、U 盘或依次运行两套流程；抓取和放置动作当前留空。
 - `keyboard_chassis_control.py`：浏览器键盘遥控。按下立即移动、松开立即停止，并由服务端看门狗处理失焦或网络中断。
 - `test/`：模式切换、前后移动、旋转和站点导航测试程序。
@@ -71,6 +71,17 @@ python3 run_pick_place_chassis.py \
 - `both`：先执行普通工件流程，再执行 U 盘流程；需要提供四个站点名称。
 
 程序只使用路网站点导航，不接受旧 task ID 或任意坐标导航。每套流程顺序为：抓取站点 -> 前进 -> 抓取占位 -> 后退 -> 放置站点 -> 前进 -> 放置占位 -> 后退。
+
+站点导航测试可在确认到站后指定地图坐标系绝对朝向：
+
+```bash
+python3 test/test_chassis_navigation.py \
+  --execute --node NP1 --target-angle 90
+```
+
+`--target-angle` 使用度，`--target-theta` 使用弧度，二者不能同时提供。未指定
+朝向时只执行原有站点导航。指定后，程序必须先确认到站，
+再等待底盘原生闭环旋转返回 `RotationStatus SUCCESS`，之后才返回成功。
 
 ## 安全说明
 

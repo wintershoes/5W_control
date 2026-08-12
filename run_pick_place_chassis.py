@@ -34,8 +34,9 @@ python3 run_pick_place_chassis.py --execute --mode both \
 """
 
 import argparse
+import math
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import rospy
 
@@ -51,6 +52,8 @@ class TaskProfile:
     name: str
     pick_station: str
     place_station: str
+    pick_theta: Optional[float]
+    place_theta: Optional[float]
     pick_forward: float
     pick_back: float
     place_forward: float
@@ -107,10 +110,13 @@ class PickPlaceChassisProgram:
         rospy.loginfo("开始执行 %s 底盘抓放流程", profile.name)
         rospy.loginfo("抓取站点: %s", profile.pick_station)
         rospy.loginfo("放置站点: %s", profile.place_station)
+        rospy.loginfo("抓取目标朝向: %s", profile.pick_theta)
+        rospy.loginfo("放置目标朝向: %s", profile.place_theta)
         rospy.loginfo("=" * 60)
 
         rospy.loginfo("[1/8] 导航到抓取站点 %s", profile.pick_station)
-        if not self.chassis.navigate_to_station(profile.pick_station):
+        if not self.chassis.navigate_to_station(
+                profile.pick_station, target_theta=profile.pick_theta):
             rospy.logerr("导航到抓取站点失败")
             return False
 
@@ -130,7 +136,8 @@ class PickPlaceChassisProgram:
             return False
 
         rospy.loginfo("[5/8] 导航到放置站点 %s", profile.place_station)
-        if not self.chassis.navigate_to_station(profile.place_station):
+        if not self.chassis.navigate_to_station(
+                profile.place_station, target_theta=profile.place_theta):
             rospy.logerr("导航到放置站点失败")
             return False
 
@@ -183,6 +190,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workpiece-place-station", default="")
     parser.add_argument("--disk-pick-station", default="")
     parser.add_argument("--disk-place-station", default="")
+    workpiece_pick_orientation = parser.add_mutually_exclusive_group()
+    workpiece_pick_orientation.add_argument(
+        "--workpiece-pick-theta", type=float, default=None,
+        help="普通工件抓取站点的绝对目标朝向（弧度）",
+    )
+    workpiece_pick_orientation.add_argument(
+        "--workpiece-pick-angle", type=float, default=None,
+        help="普通工件抓取站点的绝对目标朝向（度）",
+    )
+    workpiece_place_orientation = parser.add_mutually_exclusive_group()
+    workpiece_place_orientation.add_argument(
+        "--workpiece-place-theta", type=float, default=None,
+        help="普通工件放置站点的绝对目标朝向（弧度）",
+    )
+    workpiece_place_orientation.add_argument(
+        "--workpiece-place-angle", type=float, default=None,
+        help="普通工件放置站点的绝对目标朝向（度）",
+    )
+    disk_pick_orientation = parser.add_mutually_exclusive_group()
+    disk_pick_orientation.add_argument(
+        "--disk-pick-theta", type=float, default=None,
+        help="U 盘抓取站点的绝对目标朝向（弧度）",
+    )
+    disk_pick_orientation.add_argument(
+        "--disk-pick-angle", type=float, default=None,
+        help="U 盘抓取站点的绝对目标朝向（度）",
+    )
+    disk_place_orientation = parser.add_mutually_exclusive_group()
+    disk_place_orientation.add_argument(
+        "--disk-place-theta", type=float, default=None,
+        help="U 盘放置站点的绝对目标朝向（弧度）",
+    )
+    disk_place_orientation.add_argument(
+        "--disk-place-angle", type=float, default=None,
+        help="U 盘放置站点的绝对目标朝向（度）",
+    )
 
     # 距离沿用旧主程序当前配置，后续可按新机器人现场标定结果调整。
     parser.add_argument("--workpiece-pick-forward", type=float, default=0.30)
@@ -197,10 +240,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_profiles(args: argparse.Namespace) -> List[TaskProfile]:
+    def resolve_theta(theta, angle):
+        if theta is not None:
+            return theta
+        if angle is not None:
+            return math.radians(angle)
+        return None
+
     workpiece = TaskProfile(
         name="workpiece",
         pick_station=args.workpiece_pick_station.strip(),
         place_station=args.workpiece_place_station.strip(),
+        pick_theta=resolve_theta(
+            args.workpiece_pick_theta, args.workpiece_pick_angle
+        ),
+        place_theta=resolve_theta(
+            args.workpiece_place_theta, args.workpiece_place_angle
+        ),
         pick_forward=args.workpiece_pick_forward,
         pick_back=args.workpiece_pick_back,
         place_forward=args.workpiece_place_forward,
@@ -210,6 +266,10 @@ def build_profiles(args: argparse.Namespace) -> List[TaskProfile]:
         name="disk",
         pick_station=args.disk_pick_station.strip(),
         place_station=args.disk_place_station.strip(),
+        pick_theta=resolve_theta(args.disk_pick_theta, args.disk_pick_angle),
+        place_theta=resolve_theta(
+            args.disk_place_theta, args.disk_place_angle
+        ),
         pick_forward=args.disk_pick_forward,
         pick_back=args.disk_pick_back,
         place_forward=args.disk_place_forward,
@@ -231,6 +291,12 @@ def validate_profiles(
             parser.error("{} 模式缺少抓取站点名称".format(profile.name))
         if not profile.place_station:
             parser.error("{} 模式缺少放置站点名称".format(profile.name))
+        for field_name in ("pick_theta", "place_theta"):
+            value = getattr(profile, field_name)
+            if value is not None and not math.isfinite(value):
+                parser.error("{} 的 {} 必须是有限数值".format(
+                    profile.name, field_name
+                ))
         for field_name in (
                 "pick_forward", "pick_back", "place_forward", "place_back"):
             if getattr(profile, field_name) < 0.0:
@@ -242,11 +308,13 @@ def print_dry_run(profiles: List[TaskProfile], host: str, port: int) -> None:
     print("chassis_http: http://{}:{}".format(host, port))
     for index, profile in enumerate(profiles, start=1):
         print("\n任务 {}: {}".format(index, profile.name))
-        print("  1. AUTO 导航到抓取站点:", profile.pick_station)
+        print("  1. AUTO 导航到抓取站点:", profile.pick_station,
+              "目标朝向:", profile.pick_theta)
         print("  2. MANUAL 前进 {:.3f}m".format(profile.pick_forward))
         print("  3. 抓取动作: TODO，当前跳过")
         print("  4. MANUAL 后退 {:.3f}m".format(profile.pick_back))
-        print("  5. AUTO 导航到放置站点:", profile.place_station)
+        print("  5. AUTO 导航到放置站点:", profile.place_station,
+              "目标朝向:", profile.place_theta)
         print("  6. MANUAL 前进 {:.3f}m".format(profile.place_forward))
         print("  7. 放置动作: TODO，当前跳过")
         print("  8. MANUAL 后退 {:.3f}m".format(profile.place_back))
