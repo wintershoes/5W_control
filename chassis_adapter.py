@@ -47,7 +47,9 @@ ROTATION_STATUS_NAMES = {
 
 
 def _read_ros_string(data: bytes, offset: int):
-    """从 ROS1 序列化数据中读取一个 UTF-8 string。"""
+    """从 ROS1 序列化数据中读取一个 UTF-8 string。
+    上位机没安装jaten_msgs，这里直接解析原二进制信息吧。
+    """
     (length,) = struct.unpack_from("<I", data, offset)
     offset += 4
     end = offset + length
