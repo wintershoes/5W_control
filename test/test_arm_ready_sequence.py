@@ -5,9 +5,14 @@
 默认是诊断型 dry-run，不会控制机械臂。它会查询下位机本体启动状态，并检查
 机械臂命令订阅者、传感器、MPC 服务和左右臂 Ruckig 反馈是否符合预期：
 
+python3 test/test_arm_ready_sequence.py --sequence stance
 python3 test/test_arm_ready_sequence.py --sequence ready
 python3 test/test_arm_ready_sequence.py --sequence retract
 python3 test/test_arm_ready_sequence.py --sequence custom --joints "0,0,..."
+
+首次实机测试应先执行 ``--sequence stance --execute``。该模式只进入 stance，
+然后读取并打印当前 14 个机械臂关节角，不会发布 ``/kuavo_arm_traj``。保存这组
+实测角后，再使用 custom 模式原样复现，完成零位移控制链路测试。
 
 正式控制链路为 `/kuavo_arm_traj` -> Ruckig -> MPC/WBC -> `/joint_cmd`。
 真实发布时必须显式加 `--execute`。程序会在首次真实发布前自动查询本体状态，
@@ -23,6 +28,7 @@ dry-run 只会调用只读的 `/humanoid_controller/real_launch_status`，不会
 """
 
 import argparse
+import math
 import os
 import sys
 
@@ -36,15 +42,41 @@ if PROJECT_DIR not in sys.path:
 from arm_adapter import ArmAdapter, ArmPose, format_joint_csv, parse_joint_csv
 
 
+def print_current_arm_pose(timeout: float = 10.0) -> bool:
+    """读取 v40+ 机器人实测机械臂角度，不发布任何控制目标。"""
+    from kuavo_msgs.msg import sensorsData
+
+    try:
+        msg = rospy.wait_for_message("/sensors_data_raw", sensorsData, timeout=timeout)
+    except rospy.ROSException as exc:
+        rospy.logerr("读取 /sensors_data_raw 超时: %s", exc)
+        return False
+
+    joint_q = list(msg.joint_data.joint_q)
+    if len(joint_q) < 26:
+        rospy.logerr("joint_q 长度不足: expected >= 26, got %d", len(joint_q))
+        return False
+
+    arm_rad = joint_q[12:26]
+    arm_deg = [math.degrees(value) for value in arm_rad]
+    print("joint_q_total:", len(joint_q))
+    print("arm_joint_count:", len(arm_deg))
+    print("arm_radians:", [round(value, 6) for value in arm_rad])
+    print("arm_degrees:", [round(value, 3) for value in arm_deg])
+    print("copy_for_custom:")
+    print(format_joint_csv(arm_deg))
+    return True
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="机械臂关节控制测试；默认 dry-run",
     )
     parser.add_argument(
         "--sequence",
-        choices=("ready", "ready-disk", "retract", "custom", "preview"),
+        choices=("stance", "ready", "ready-disk", "retract", "custom", "preview"),
         default="preview",
-        help="要测试的机械臂动作序列",
+        help="stance 只初始化并读取实测角；其余为机械臂动作序列",
     )
     parser.add_argument(
         "--execute",
@@ -120,7 +152,13 @@ def main() -> int:
             print("custom joints:", format_joint_csv(joints))
         return 0 if diagnostics.get("body_program_ready") else 1
 
-    if args.sequence == "ready":
+    if args.sequence == "stance":
+        ok = arm.ensure_stance_ready()
+        if ok:
+            print()
+            print("=== current arm pose after stance (read-only) ===")
+            ok = print_current_arm_pose()
+    elif args.sequence == "ready":
         ok = arm.move_to_ready_position(disk=False)
     elif args.sequence == "ready-disk":
         ok = arm.move_to_ready_position(disk=True)

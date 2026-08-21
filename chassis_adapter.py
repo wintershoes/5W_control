@@ -115,7 +115,9 @@ def decode_path_track_state(data: bytes) -> Dict[str, Any]:
 
 
 class PathTrackFeedbackMonitor:
-    """订阅路网执行状态，并为同步导航调用提供线程安全的状态快照。"""
+    """订阅路网执行状态，并为同步导航调用提供线程安全的状态快照。
+    以下三个函数互相配合，用来获取底盘的状态，不是简单粗暴的反复询问，是等底盘发来消息的时候才更新。
+    """
 
     def __init__(self, topic: str = PATH_TRACK_TOPIC):
         self.topic = topic

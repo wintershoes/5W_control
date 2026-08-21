@@ -433,7 +433,9 @@ class ArmAdapter:
         wait: bool = True,
         fallback_duration: Optional[float] = None,
     ) -> bool:
-        """发布一帧 14 关节角度，并按左右臂 Ruckig 预计时间等待。"""
+        """发布一帧 14 关节角度，并按左右臂 Ruckig 预计时间等待。
+        注意这里是pose是自己定义的，还增加了是否经过验证的标记。
+        """
         pose.validate()
         fallback = pose.old_duration if fallback_duration is None else float(fallback_duration)
         if fallback < 0.0:
@@ -517,6 +519,7 @@ class ArmAdapter:
         rospy.loginfo("夹爪原来单独调用服务，本 adapter 暂不处理夹爪")
 
     def _left_reach_time_callback(self, msg: Float32) -> None:
+        '''这里的两个reach_time是机械臂规划程序，计算出来的机械臂执行时间。'''
         self._record_reach_time("left", msg.data)
 
     def _right_reach_time_callback(self, msg: Float32) -> None:
